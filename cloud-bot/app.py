@@ -65,11 +65,24 @@ def send_video(sender, video):
 def process(job_id, sender, url):
     with tempfile.TemporaryDirectory(prefix='reel-bot-') as directory:
         app.logger.info('Video download started')
-        subprocess.run(['python', '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
+        download = subprocess.run(['python', '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
             '--max-filesize', '30M', '--socket-timeout', '15', '--retries', '1',
             '--format', 'best[ext=mp4][height<=?1280]/best[height<=?1280]/bestvideo[height<=?1280]+bestaudio',
             '--output', directory + '/source.%(ext)s', '--', url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120, text=True)
+        if download.returncode:
+            diagnostic = (download.stderr or '').lower()
+            reason = 'extractor_error'
+            for marker, label in [('requested format is not available', 'format_unavailable'),
+                ('login required', 'login_required'), ('login', 'login_or_rate_limit'),
+                ('rate-limit', 'rate_limited'), ('http error 403', 'http_403'),
+                ('http error 429', 'http_429'), ('not available', 'content_unavailable'),
+                ('timed out', 'network_timeout'), ('too large', 'download_size_limit')]:
+                if marker in diagnostic:
+                    reason = label
+                    break
+            app.logger.warning('Video download rejected reason=%s', reason)
+            raise subprocess.CalledProcessError(download.returncode, ['yt_dlp'])
         source = next(p for p in Path(directory).glob('source.*') if p.suffix not in ('.part','.ytdl'))
         app.logger.info('Video download completed bytes=%s', source.stat().st_size)
         if source.stat().st_size > 30 * 1024 * 1024:
