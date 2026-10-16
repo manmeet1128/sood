@@ -1,5 +1,6 @@
 import hashlib, hmac, json, os, queue, re, shutil, sqlite3, subprocess, tempfile, threading, time, urllib.request
 from pathlib import Path
+from contextlib import contextmanager
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -9,10 +10,15 @@ JOBS = queue.Queue(maxsize=20)
 MOCK = os.environ.get('MOCK_SEND', 'true').lower() != 'false'
 ALLOWED = re.compile(r'https://(?:www\.|m\.)?(?:instagram\.com/(?:reel|reels|p)/[^\s<>]+|youtube\.com/shorts/[^\s<>]+|youtu\.be/[^\s<>]+|facebook\.com/(?:reel/|reels/|share/r/|watch/)[^\s<>]+)', re.I)
 
+@contextmanager
 def db():
     conn = sqlite3.connect(DB, timeout=10)
-    conn.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, sender TEXT, url TEXT, state TEXT, created REAL)')
-    return conn
+    try:
+        with conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, sender TEXT, url TEXT, state TEXT, created REAL)')
+            yield conn
+    finally:
+        conn.close()
 
 
 def graph(path, payload=None, content_type='application/json'):
@@ -78,6 +84,30 @@ def health():
     return jsonify(status='ok', sending_enabled=not MOCK)
 
 
+@app.get('/privacy')
+def privacy():
+    return '''<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daas WhatsApp Downloader — Privacy policy</title>
+<style>body{font:17px/1.65 system-ui,sans-serif;max-width:760px;margin:48px auto;padding:0 24px;color:#17252a}h1,h2{line-height:1.25}a{color:#075e54}</style>
+<main><h1>Daas WhatsApp Downloader</h1><h2>Privacy policy</h2><p>Updated 16 October 2026. Operated by Manmeet Sood.</p>
+<p>This bot processes public video links you send through WhatsApp so it can attempt to download and return the video. Only submit links you have permission to use. The service is a prototype and may be unavailable or unable to download a link.</p>
+<h2>Information processed</h2><p>The server receives WhatsApp webhook events, which may include your WhatsApp number, message text, message identifier, timestamp and other metadata provided by Meta. For accepted video requests, it stores your number, the matched video URL, message identifier, processing status and creation time in a local database to process requests and prevent duplicate work. The complete message text is not stored in that database.</p>
+<h2>Use and sharing</h2><p>Information is used to handle your request and operate the bot. Render hosts the server. Meta provides WhatsApp messaging and, when sending is enabled, receives your recipient number and the video for delivery. Video platforms receive download requests for the submitted URLs. These providers may process service and network data under their own policies. The bot does not implement advertising, tracking cookies or a sale of your information.</p>
+<h2>Retention</h2><p>Downloaded and converted video files are temporary and are removed when processing finishes or fails. Request records remain in the local database until removed by the operator or lost when Render replaces the service's temporary filesystem. There is currently no scheduled record-expiration process. Queued requests may be lost on restart. Render, Meta and video platforms may retain their own logs or copies under their policies. WhatsApp chat history and delivered videos are separate from the bot's temporary files.</p>
+<h2>Your choices and contact</h2><p>Stop sending messages to stop making new requests. For privacy questions or deletion requests, contact the operator using the contact details on this number's WhatsApp business profile. Include only enough information to identify your request; never send passwords or access tokens. Requests require manual review. Do not post your phone number or private messages in public repository issues.</p>
+<p><a href="/data-deletion">Data deletion instructions</a></p></main></html>'''
+
+
+@app.get('/data-deletion')
+def data_deletion():
+    return '''<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daas — Data deletion</title><style>body{font:17px/1.65 system-ui,sans-serif;max-width:760px;margin:48px auto;padding:0 24px;color:#17252a}</style>
+<main><h1>Data deletion instructions</h1><p>Contact the operator using the contact details on this bot number's WhatsApp business profile and request deletion of your bot request records. Identify the WhatsApp number you used and, if available, the approximate date of your request. Never provide passwords or access tokens. This is a manual request, not an automated deletion command.</p>
+<p>Bot request records contain the sender number, submitted video URL, message identifier, processing status and creation time. Downloaded video files are removed after processing. Deleting bot records does not remove messages or videos already delivered to WhatsApp, or copies and logs retained independently by Meta, Render or video platforms. Manage your WhatsApp chat history separately.</p><p><a href="/privacy">Privacy policy</a></p></main></html>'''
+
+
 @app.get('/webhook')
 def verify():
     token = os.environ.get('WEBHOOK_VERIFY_TOKEN', '')
@@ -126,3 +156,4 @@ def webhook():
     return '', 200
 
 threading.Thread(target=worker, daemon=True).start()
+
