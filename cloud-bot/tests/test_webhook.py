@@ -81,28 +81,33 @@ class WebhookTests(unittest.TestCase):
             self.assertIn('rate-limiting', body)
             self.assertNotIn('example/', body)
 
-    def test_original_document_preserves_bytes_and_expires(self):
+    def test_native_video_preserves_bytes_and_uses_video_message(self):
         original = b'original-video-bytes-without-reencoding'
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'source.mp4'
             source.write_bytes(original)
             with patch.object(self.bot, 'MOCK', False), \
-                 patch.dict(os.environ, PUBLIC_BASE_URL='https://example.invalid', WHATSAPP_PHONE_NUMBER_ID='test-phone'), \
-                 patch.object(self.bot, 'graph', return_value={'messages': [{'id': 'test'}]}) as graph:
-                self.bot.send_original('919999999999', source)
-            payload = json.loads(graph.call_args.args[1])
-            self.assertEqual(payload['type'], 'document')
+                 patch.dict(os.environ, WHATSAPP_PHONE_NUMBER_ID='test-phone'), \
+                 patch.object(self.bot, 'graph', side_effect=[{'id': 'media'}, {'messages': [{'id': 'test'}]}]) as graph:
+                self.bot.send_native_video('919999999999', source)
+            self.assertIn(original, graph.call_args_list[0].args[1])
+            payload = json.loads(graph.call_args_list[1].args[1])
+            self.assertEqual(payload['type'], 'video')
+            self.assertEqual(payload['video'], {'id': 'media'})
+            self.assertNotIn('document', payload)
             self.assertNotIn('text', payload)
-            path = '/media-fetch/' + payload['document']['link'].rsplit('/', 1)[-1]
-            with self.client.get(path) as response:
-                self.assertEqual(response.data, original)
-                self.assertIn('attachment;', response.headers['Content-Disposition'])
-                self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
-            token = path.rsplit('/', 1)[-1]
-            stored_path = self.bot.DOWNLOAD_FILES[token]['path']
-            self.bot.DOWNLOAD_FILES[token]['expires'] = 0
-            self.assertEqual(self.client.get(path).status_code, 404)
-            self.assertFalse(stored_path.exists())
+
+    def test_oversized_original_is_not_compressed_or_sent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.mp4'
+            source.write_bytes(b'x')
+            with patch.object(self.bot, 'MAX_NATIVE_VIDEO_BYTES', 0), \
+                 patch.object(self.bot, 'graph') as graph:
+                with self.assertRaises(self.bot.DownloadFailure) as context:
+                    self.bot.send_native_video('919999999999', source)
+            graph.assert_not_called()
+            self.assertIn('16 MB', self.bot.failure_text(context.exception))
+
 
 if __name__=='__main__':
     unittest.main()
