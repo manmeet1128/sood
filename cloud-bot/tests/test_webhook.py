@@ -81,6 +81,29 @@ class WebhookTests(unittest.TestCase):
             self.assertIn('rate-limiting', body)
             self.assertNotIn('example/', body)
 
+    def test_original_document_preserves_bytes_and_expires(self):
+        original = b'original-video-bytes-without-reencoding'
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.mp4'
+            source.write_bytes(original)
+            with patch.object(self.bot, 'MOCK', False), \
+                 patch.dict(os.environ, PUBLIC_BASE_URL='https://example.invalid', WHATSAPP_PHONE_NUMBER_ID='test-phone'), \
+                 patch.object(self.bot, 'graph', return_value={'messages': [{'id': 'test'}]}) as graph:
+                self.bot.send_original('919999999999', source)
+            payload = json.loads(graph.call_args.args[1])
+            self.assertEqual(payload['type'], 'document')
+            self.assertNotIn('text', payload)
+            path = '/media-fetch/' + payload['document']['link'].rsplit('/', 1)[-1]
+            with self.client.get(path) as response:
+                self.assertEqual(response.data, original)
+                self.assertIn('attachment;', response.headers['Content-Disposition'])
+                self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+            token = path.rsplit('/', 1)[-1]
+            stored_path = self.bot.DOWNLOAD_FILES[token]['path']
+            self.bot.DOWNLOAD_FILES[token]['expires'] = 0
+            self.assertEqual(self.client.get(path).status_code, 404)
+            self.assertFalse(stored_path.exists())
+
 if __name__=='__main__':
     unittest.main()
 
