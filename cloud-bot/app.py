@@ -48,7 +48,7 @@ def process(job_id, sender, url):
     with tempfile.TemporaryDirectory(prefix='reel-bot-') as directory:
         subprocess.run(['python', '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
             '--max-filesize', '30M', '--socket-timeout', '15', '--retries', '1',
-            '--format', 'best[ext=mp4][height<=720]/best[height<=720]',
+            '--format', 'best[ext=mp4][height<=?1280]/best[height<=?1280]/bestvideo[height<=?1280]+bestaudio',
             '--output', directory + '/source.%(ext)s', '--', url],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
         source = next(p for p in Path(directory).glob('source.*') if p.suffix not in ('.part','.ytdl'))
