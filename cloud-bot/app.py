@@ -237,6 +237,11 @@ def webhook():
         return '', 400
     for entry in data.get('entry', []):
         for change in entry.get('changes', []):
+            for status in change.get('value', {}).get('statuses', []):
+                delivery_state = status.get('status')
+                if delivery_state in ('sent', 'delivered', 'read', 'failed'):
+                    codes = [e.get('code') for e in status.get('errors', []) if type(e.get('code')) is int]
+                    app.logger.info('WhatsApp delivery status=%s error_codes=%s', delivery_state, codes)
             for message in change.get('value', {}).get('messages', []):
                 if message.get('type') != 'text':
                     continue
