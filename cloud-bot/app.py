@@ -234,3 +234,18 @@ def webhook():
 
 threading.Thread(target=worker, daemon=True).start()
 
+# Optional one-off deployment probe. It never sends a WhatsApp message.
+def deployment_probe():
+    probe_url = os.environ.get('STARTUP_PROBE_URL', '')
+    if not probe_url or not MOCK or not ALLOWED.fullmatch(probe_url):
+        return
+    try:
+        process('deployment-probe', '', probe_url)
+        app.logger.info('Deployment download probe passed')
+    except Exception as error:
+        app.logger.warning('Deployment download probe failed error_type=%s reason=%s',
+            type(error).__name__, getattr(error, 'reason', 'processing_error'))
+
+
+threading.Thread(target=deployment_probe, daemon=True).start()
+
