@@ -1,9 +1,11 @@
 import hashlib, hmac, json, os, queue, re, shutil, sqlite3, subprocess, tempfile, threading, time, urllib.request
 from pathlib import Path
 from contextlib import contextmanager
+import urllib.error
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+app.logger.setLevel('INFO')
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
 DB = os.environ.get('STATE_DB', '/tmp/reel-bot.sqlite')
 JOBS = queue.Queue(maxsize=20)
@@ -26,8 +28,24 @@ def graph(path, payload=None, content_type='application/json'):
     version = os.environ['GRAPH_API_VERSION']
     req = urllib.request.Request(f'https://graph.facebook.com/{version}/{path}', data=payload,
         headers={'Authorization': 'Bearer ' + token, 'Content-Type': content_type})
-    with urllib.request.urlopen(req, timeout=60) as response:
-        return json.load(response)
+    operation = path.rsplit('/', 1)[-1]
+    app.logger.info('WhatsApp operation=%s started', operation)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.load(response)
+        app.logger.info('WhatsApp operation=%s accepted', operation)
+        return result
+    except urllib.error.HTTPError as error:
+        code = subcode = None
+        try:
+            detail = json.load(error).get('error', {})
+            code = detail.get('code') if type(detail.get('code')) is int else None
+            subcode = detail.get('error_subcode') if type(detail.get('error_subcode')) is int else None
+        except (ValueError, AttributeError, TypeError):
+            pass
+        app.logger.warning('WhatsApp operation=%s failed http_status=%s api_code=%s api_subcode=%s',
+            operation, error.code, code, subcode)
+        raise
 
 
 def send_video(sender, video):
@@ -46,20 +64,24 @@ def send_video(sender, video):
 
 def process(job_id, sender, url):
     with tempfile.TemporaryDirectory(prefix='reel-bot-') as directory:
+        app.logger.info('Video download started')
         subprocess.run(['python', '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
             '--max-filesize', '30M', '--socket-timeout', '15', '--retries', '1',
             '--format', 'best[ext=mp4][height<=?1280]/best[height<=?1280]/bestvideo[height<=?1280]+bestaudio',
             '--output', directory + '/source.%(ext)s', '--', url],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
         source = next(p for p in Path(directory).glob('source.*') if p.suffix not in ('.part','.ytdl'))
+        app.logger.info('Video download completed bytes=%s', source.stat().st_size)
         if source.stat().st_size > 30 * 1024 * 1024:
             raise ValueError('Download too large')
         target = Path(directory) / 'video.mp4'
+        app.logger.info('Video conversion started')
         subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(source),'-t','180',
             '-vf',"scale='min(720,iw)':-2",'-c:v','libx264','-preset','veryfast','-crf','28',
             '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
         if target.stat().st_size > 15 * 1024 * 1024:
+            app.logger.info('Video compression retry started')
             # Retry with a duration-based bitrate and room for audio/container overhead.
             duration = min(180, float(subprocess.check_output(['ffprobe', '-v', 'error',
                 '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', str(target)],
@@ -74,6 +96,7 @@ def process(job_id, sender, url):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
             if target.stat().st_size > 15 * 1024 * 1024:
                 raise ValueError('Video too large for this bot')
+        app.logger.info('Video conversion completed bytes=%s', target.stat().st_size)
         send_video(sender, target)
 
 
@@ -81,15 +104,19 @@ def worker():
     while True:
         job_id, sender, url = JOBS.get()
         state = 'done'
+        started = time.monotonic()
+        app.logger.info('Video job started')
         try:
             process(job_id, sender, url)
-        except Exception:
+        except Exception as error:
             state = 'failed'
-            app.logger.warning('A download or send failed; no message contents or credentials logged')
+            app.logger.warning('Video job failed error_type=%s exit_code=%s elapsed_seconds=%.1f',
+                type(error).__name__, getattr(error, 'returncode', None), time.monotonic() - started)
         finally:
             with db() as conn:
                 conn.execute('UPDATE jobs SET state=? WHERE id=?',(state, job_id))
             JOBS.task_done()
+            app.logger.info('Video job finished state=%s elapsed_seconds=%.1f', state, time.monotonic() - started)
 
 
 @app.get('/health')
@@ -163,6 +190,7 @@ def webhook():
                         continue
                     try:
                         JOBS.put_nowait((job_id,sender,match[0]))
+                        app.logger.info('Video request queued')
                     except queue.Full:
                         conn.execute('DELETE FROM jobs WHERE id=?',(job_id,))
                         return '', 503
