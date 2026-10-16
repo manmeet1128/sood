@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: whatsapp-reel-downloader
+    runtime: docker
+    plan: free
+    rootDir: cloud-bot
+    healthCheckPath: /health
+    envVars:
+      - key: MOCK_SEND
+        value: "true"
+      - key: WEBHOOK_VERIFY_TOKEN
+        generateValue: true
+      - key: META_APP_SECRET
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: GRAPH_API_VERSION
+        sync: false
