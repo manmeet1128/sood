@@ -2,7 +2,8 @@ import hashlib, hmac, json, os, queue, re, shutil, sqlite3, subprocess, tempfile
 from pathlib import Path
 from contextlib import contextmanager
 import urllib.error
-from flask import Flask, request, jsonify
+import secrets
+from flask import Flask, request, jsonify, send_file, abort
 
 app = Flask(__name__)
 app.logger.setLevel('INFO')
@@ -19,6 +20,10 @@ class DownloadFailure(Exception):
 
 
 def failure_text(error):
+    if isinstance(error, DownloadFailure) and error.reason == 'original_delivery_rejected':
+        return 'WhatsApp could not accept the original video file. It has not been compressed, split, or replaced with a link.'
+    if isinstance(error, DownloadFailure) and error.reason == 'download_size_limit':
+        return "The original video exceeds this bot's 100 MB download limit. It has not been compressed or split."
     if isinstance(error, DownloadFailure) and error.reason in ('http_429', 'rate_limited', 'login_or_rate_limit'):
         return 'The video source is rate-limiting requests from this server. No video was downloaded. Please try later or send another link.'
     return 'I could not download or send this video. Please check that the link is public and try another short video.'
@@ -67,28 +72,77 @@ def graph(path, payload=None, content_type='application/json'):
         raise
 
 
-def send_video(sender, video):
+DOWNLOAD_FILES = {}
+DOWNLOAD_LOCK = threading.Lock()
+DOWNLOAD_ROOT = Path(tempfile.gettempdir()) / 'reel-bot-originals'
+DOWNLOAD_TTL = 3600
+
+
+def prune_downloads():
+    now = time.time()
+    with DOWNLOAD_LOCK:
+        for token, item in list(DOWNLOAD_FILES.items()):
+            if item['expires'] <= now:
+                item['path'].unlink(missing_ok=True)
+                del DOWNLOAD_FILES[token]
+
+
+def host_for_meta(source):
+    # A short-lived media-fetch URL for Meta; users receive a document, never this URL.
+    base = (os.environ.get('PUBLIC_BASE_URL') or os.environ.get('RENDER_EXTERNAL_URL', '')).rstrip('/')
+    if not base.startswith('https://'):
+        raise ValueError('Public media-fetch base URL is missing')
+    prune_downloads()
+    token = secrets.token_urlsafe(32)
+    DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    target = DOWNLOAD_ROOT / (token + source.suffix)
+    with DOWNLOAD_LOCK:
+        if sum(i['path'].stat().st_size for i in DOWNLOAD_FILES.values()) + source.stat().st_size > 256 * 1024 * 1024:
+            raise ValueError('Temporary media storage is full')
+        shutil.copyfile(source, target)
+        DOWNLOAD_FILES[token] = {'path': target, 'expires': time.time() + DOWNLOAD_TTL}
+    return token, base + '/media-fetch/' + token
+
+
+@app.get('/media-fetch/<token>')
+def media_fetch(token):
+    prune_downloads()
+    with DOWNLOAD_LOCK:
+        item = DOWNLOAD_FILES.get(token)
+        if item is None:
+            abort(404)
+        path = item['path']
+    response = send_file(path, mimetype='video/mp4', as_attachment=True, download_name='video' + path.suffix)
+    response.headers['Cache-Control'] = 'private, no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    return response
+
+
+def send_original(sender, source):
     if MOCK:
         return
-    boundary = 'reelbot' + os.urandom(12).hex()
-    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="messaging_product"\r\n\r\nwhatsapp\r\n'
-        f'--{boundary}\r\nContent-Disposition: form-data; name="type"\r\n\r\nvideo/mp4\r\n'
-        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="video.mp4"\r\nContent-Type: video/mp4\r\n\r\n').encode()
-    body += video.read_bytes() + f'\r\n--{boundary}--\r\n'.encode()
-    phone = os.environ['WHATSAPP_PHONE_NUMBER_ID']
-    media = graph(phone + '/media', body, 'multipart/form-data; boundary=' + boundary)
-    graph(phone + '/messages', json.dumps({'messaging_product':'whatsapp','to':sender,
-        'type':'video','video':{'id':media['id']}}).encode())
+    token, url = host_for_meta(source)
+    try:
+        graph(os.environ['WHATSAPP_PHONE_NUMBER_ID'] + '/messages', json.dumps({
+            'messaging_product': 'whatsapp', 'to': sender, 'type': 'document',
+            'document': {'link': url, 'filename': 'video' + source.suffix}}).encode())
+    except Exception as error:
+        with DOWNLOAD_LOCK:
+            item = DOWNLOAD_FILES.pop(token, None)
+            if item:
+                item['path'].unlink(missing_ok=True)
+        raise DownloadFailure('original_delivery_rejected') from error
 
 
 def process(job_id, sender, url):
     with tempfile.TemporaryDirectory(prefix='reel-bot-') as directory:
-        app.logger.info('Video download started')
+        app.logger.info('Original-quality video download started')
         download = subprocess.run(['python', '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
-            '--max-filesize', '30M', '--socket-timeout', '15', '--retries', '1',
-            '--format', 'best[ext=mp4][height<=?1280]/best[height<=?1280]/bestvideo[height<=?1280]+bestaudio',
-            '--output', directory + '/source.%(ext)s', '--', url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120, text=True)
+            '--max-filesize', '100M', '--socket-timeout', '15', '--retries', '1',
+            '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '--merge-output-format', 'mp4', '--output', directory + '/source.%(ext)s', '--', url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180, text=True)
         if download.returncode:
             diagnostic = (download.stderr or '').lower()
             reason = 'extractor_error'
@@ -102,36 +156,11 @@ def process(job_id, sender, url):
                     break
             app.logger.warning('Video download rejected reason=%s', reason)
             raise DownloadFailure(reason)
-        source = next(p for p in Path(directory).glob('source.*') if p.suffix not in ('.part','.ytdl'))
-        app.logger.info('Video download completed bytes=%s', source.stat().st_size)
-        if source.stat().st_size > 30 * 1024 * 1024:
-            raise ValueError('Download too large')
-        target = Path(directory) / 'video.mp4'
-        app.logger.info('Video conversion started')
-        subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(source),'-t','180',
-            '-vf',"scale='min(480,iw)':-2,fps=24",'-filter_threads','1','-threads','1',
-            '-c:v','libx264','-preset','ultrafast','-crf','30',
-            '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
-        if target.stat().st_size > 15 * 1024 * 1024:
-            app.logger.info('Video compression retry started')
-            # Retry with a duration-based bitrate and room for audio/container overhead.
-            duration = min(180, float(subprocess.check_output(['ffprobe', '-v', 'error',
-                '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', str(target)],
-                timeout=15)))
-            if duration <= 0:
-                raise ValueError('Invalid video duration')
-            bitrate = max(100000, int(13 * 1024 * 1024 * 8 / duration) - 96000)
-            subprocess.run(['ffmpeg','-y','-nostdin','-v','error','-i',str(source),'-t','180',
-                '-vf',"scale='min(480,iw)':-2,fps=24",'-filter_threads','1','-threads','1',
-                '-c:v','libx264','-preset','ultrafast',
-                '-b:v',str(bitrate),'-maxrate',str(bitrate),'-bufsize',str(bitrate * 2),
-                '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
-            if target.stat().st_size > 15 * 1024 * 1024:
-                raise ValueError('Video too large for this bot')
-        app.logger.info('Video conversion completed bytes=%s', target.stat().st_size)
-        send_video(sender, target)
+        source = next(p for p in Path(directory).glob('source.*') if p.suffix not in ('.part', '.ytdl'))
+        if source.stat().st_size > 100 * 1024 * 1024:
+            raise DownloadFailure('download_size_limit')
+        app.logger.info('Original video ready bytes=%s; no re-encoding, resizing, or trimming', source.stat().st_size)
+        send_original(sender, source)
 
 
 def worker():
@@ -172,7 +201,7 @@ def privacy():
 <p>This bot processes public video links you send through WhatsApp so it can attempt to download and return the video. Only submit links you have permission to use. The service is a prototype and may be unavailable or unable to download a link.</p>
 <h2>Information processed</h2><p>The server receives WhatsApp webhook events, which may include your WhatsApp number, message text, message identifier, timestamp and other metadata provided by Meta. For accepted video requests, it stores your number, the matched video URL, message identifier, processing status and creation time in a local database to process requests and prevent duplicate work. The complete message text is not stored in that database.</p>
 <h2>Use and sharing</h2><p>Information is used to handle your request and operate the bot. Render hosts the server. Meta provides WhatsApp messaging and, when sending is enabled, receives your recipient number and the video for delivery. Video platforms receive download requests for the submitted URLs. These providers may process service and network data under their own policies. The bot does not implement advertising, tracking cookies or a sale of your information.</p>
-<h2>Retention</h2><p>Downloaded and converted video files are temporary and are removed when processing finishes or fails. Request records remain in the local database until removed by the operator or lost when Render replaces the service's temporary filesystem. There is currently no scheduled record-expiration process. Queued requests may be lost on restart. Render, Meta and video platforms may retain their own logs or copies under their policies. WhatsApp chat history and delivered videos are separate from the bot's temporary files.</p>
+<h2>Retention</h2><p>Original video files are held temporarily for Meta to fetch and deliver as a document. Access requires an unguessable media-fetch URL. These files expire after one hour, may be lost earlier on a service restart, and are removed by periodic cleanup. Videos are not re-encoded, resized or trimmed by the bot. Request records remain in the local database until removed by the operator or lost when Render replaces the service's temporary filesystem. There is currently no scheduled record-expiration process. Queued requests may be lost on restart. Render, Meta and video platforms may retain their own logs or copies under their policies. WhatsApp chat history and delivered videos are separate from the bot's temporary files.</p>
 <h2>Your choices and contact</h2><p>Stop sending messages to stop making new requests. For privacy questions or deletion requests, contact the operator using the contact details on this number's WhatsApp business profile. Include only enough information to identify your request; never send passwords or access tokens. Requests require manual review. Do not post your phone number or private messages in public repository issues.</p>
 <p><a href="/data-deletion">Data deletion instructions</a></p></main></html>'''
 
@@ -183,7 +212,7 @@ def data_deletion():
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Daas — Data deletion</title><style>body{font:17px/1.65 system-ui,sans-serif;max-width:760px;margin:48px auto;padding:0 24px;color:#17252a}</style>
 <main><h1>Data deletion instructions</h1><p>Contact the operator using the contact details on this bot number's WhatsApp business profile and request deletion of your bot request records. Identify the WhatsApp number you used and, if available, the approximate date of your request. Never provide passwords or access tokens. This is a manual request, not an automated deletion command.</p>
-<p>Bot request records contain the sender number, submitted video URL, message identifier, processing status and creation time. Downloaded video files are removed after processing. Deleting bot records does not remove messages or videos already delivered to WhatsApp, or copies and logs retained independently by Meta, Render or video platforms. Manage your WhatsApp chat history separately.</p><p><a href="/privacy">Privacy policy</a></p></main></html>'''
+<p>Bot request records contain the sender number, submitted video URL, message identifier, processing status and creation time. Temporary original video files expire after one hour or may be lost earlier on restart. Deleting bot records does not remove messages or videos already delivered to WhatsApp, or copies and logs retained independently by Meta, Render or video platforms. Manage your WhatsApp chat history separately.</p><p><a href="/privacy">Privacy policy</a></p></main></html>'''
 
 
 @app.get('/webhook')
@@ -250,4 +279,13 @@ def deployment_probe():
 
 
 threading.Thread(target=deployment_probe, daemon=True).start()
+
+
+def media_cleanup_worker():
+    while True:
+        time.sleep(60)
+        prune_downloads()
+
+
+threading.Thread(target=media_cleanup_worker, daemon=True).start()
 
