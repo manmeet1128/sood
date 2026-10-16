@@ -2,7 +2,7 @@ import makeWASocket, {DisconnectReason, useMultiFileAuthState} from 'baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
 import {createServer} from 'node:http';
-import {timingSafeEqual} from 'node:crypto';
+import {timingSafeEqual, createHmac} from 'node:crypto';
 import {mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -18,6 +18,12 @@ let reconnectTimer;
 const queue = [], seen = new Map();
 const log = event => console.log(JSON.stringify({event}));
 const logger = pino({level:'silent'});
+const session = createHmac('sha256',password).update('sood-admin-session-v1').digest('hex');
+function equal(a,b) {
+  const first = Buffer.from(a), second = Buffer.from(b);
+  return first.length === second.length && timingSafeEqual(first,second);
+}
+const loginForm = '<!doctype html><meta name="viewport" content="width=device-width"><title>Bot sign in</title><h1>Daas bot pairing</h1><form action="/login" method="post"><label>Admin password <input type="password" name="password" autocomplete="current-password" required></label><button>Sign in</button></form>';
 
 async function drain() {
   if (running || status !== 'connected') return;
@@ -79,10 +85,19 @@ const server = createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options','nosniff');
   res.setHeader('Referrer-Policy','no-referrer');
   if (req.url === '/health') {res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify({status:'ok',whatsapp:status}));}
-  const expected = Buffer.from('Basic '+Buffer.from('admin:'+password).toString('base64'));
-  const supplied = Buffer.from(req.headers.authorization || '');
-  if (supplied.length !== expected.length || !timingSafeEqual(supplied,expected)) {
-    res.writeHead(401, {'WWW-Authenticate':'Basic realm="Bot pairing"'}); return res.end('Sign in to pair the bot.');
+  if (req.url === '/login' && req.method === 'POST') {
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk.toString();
+      if (body.length > 1024) {res.writeHead(413); return res.end();}
+    }
+    if (!equal(new URLSearchParams(body).get('password') || '',password)) {res.writeHead(403); return res.end('Invalid password');}
+    res.writeHead(303, {'Set-Cookie':`bot_session=${session}; HttpOnly; Secure; SameSite=Strict; Path=/`, Location:'/'});
+    return res.end();
+  }
+  const cookie = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('bot_session='))?.slice(12) || '';
+  if (!equal(cookie,session)) {
+    res.setHeader('Content-Type','text/html; charset=utf-8'); return res.end(loginForm);
   }
   if (req.url !== '/') {res.writeHead(404); return res.end();}
   res.setHeader('Content-Type','text/html; charset=utf-8');
