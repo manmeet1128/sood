@@ -6,7 +6,7 @@ The bot receives fresh direct-message public Reel/Short links, downloads the bes
 
 ## Free cloud setup
 
-Render Docker web service: root directory `linked-bot`, Dockerfile `./Dockerfile`, region Frankfurt, plan Free, health path `/health`. Set a random `ADMIN_PASSWORD` of at least 24 characters. Open the HTTPS service root, sign in with user `admin` and that password, then scan the QR on the bot phone. QR and session credentials are never logged. Only the password-protected page exposes the QR. Do not publish its screenshot.
+Render Docker web service: root directory `linked-bot`, Dockerfile `./Dockerfile`, region Frankfurt, plan Free, health path `/health`. Set a random `ADMIN_PASSWORD` of at least 24 characters. The deployed service is https://sood-linked-video.onrender.com. Open the HTTPS service root, enter that admin password in the sign-in form, then scan the QR on the bot phone. The password is stored in Render's environment settings, not in this repository. QR and session credentials are never logged. Only the password-protected page exposes the QR. Do not publish its screenshot.
 
 Free Render sleeps after inactivity and does not provide persistent disks. `/tmp/sood-linked-auth` contains sensitive session keys and can disappear on redeploy/restart: pairing must then be repeated. Queued jobs/dedup records are in memory; temporary videos are deleted after processing. This free setup is not continuously available. Do not use artificial keep-alive traffic. The paid persistent disk option has not been enabled.
 
