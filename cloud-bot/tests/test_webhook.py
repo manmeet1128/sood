@@ -1,5 +1,6 @@
 import hashlib, hmac, importlib.util, json, os, tempfile, time, unittest
 from pathlib import Path
+from unittest.mock import patch
 
 class WebhookTests(unittest.TestCase):
     @classmethod
@@ -69,5 +70,17 @@ class WebhookTests(unittest.TestCase):
         finally:
             self.bot.MOCK = True
 
+    def test_rate_limited_job_notifies_sender_without_private_details(self):
+        with patch.object(self.bot, 'process', side_effect=self.bot.DownloadFailure('http_429')), \
+             patch.object(self.bot, 'send_text') as notify:
+            self.assertEqual(self.post(self.message('rate-limit')).status_code, 200)
+            self.bot.JOBS.join()
+            notify.assert_called_once()
+            recipient, body = notify.call_args.args
+            self.assertEqual(recipient, '919999999999')
+            self.assertIn('rate-limiting', body)
+            self.assertNotIn('example/', body)
+
 if __name__=='__main__':
     unittest.main()
+
