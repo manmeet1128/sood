@@ -109,7 +109,8 @@ def process(job_id, sender, url):
         target = Path(directory) / 'video.mp4'
         app.logger.info('Video conversion started')
         subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(source),'-t','180',
-            '-vf',"scale='min(720,iw)':-2",'-c:v','libx264','-preset','veryfast','-crf','28',
+            '-vf',"scale='min(480,iw)':-2,fps=24",'-filter_threads','1','-threads','1',
+            '-c:v','libx264','-preset','ultrafast','-crf','30',
             '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
         if target.stat().st_size > 15 * 1024 * 1024:
@@ -122,7 +123,8 @@ def process(job_id, sender, url):
                 raise ValueError('Invalid video duration')
             bitrate = max(100000, int(13 * 1024 * 1024 * 8 / duration) - 96000)
             subprocess.run(['ffmpeg','-y','-nostdin','-v','error','-i',str(source),'-t','180',
-                '-vf',"scale='min(720,iw)':-2",'-c:v','libx264','-preset','veryfast',
+                '-vf',"scale='min(480,iw)':-2,fps=24",'-filter_threads','1','-threads','1',
+                '-c:v','libx264','-preset','ultrafast',
                 '-b:v',str(bitrate),'-maxrate',str(bitrate),'-bufsize',str(bitrate * 2),
                 '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
