@@ -12,6 +12,25 @@ JOBS = queue.Queue(maxsize=20)
 MOCK = os.environ.get('MOCK_SEND', 'true').lower() != 'false'
 ALLOWED = re.compile(r'https://(?:www\.|m\.)?(?:instagram\.com/(?:reel|reels|p)/[^\s<>]+|youtube\.com/shorts/[^\s<>]+|youtu\.be/[^\s<>]+|facebook\.com/(?:reel/|reels/|share/r/|watch/)[^\s<>]+)', re.I)
 
+class DownloadFailure(Exception):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__('Video download failed')
+
+
+def failure_text(error):
+    if isinstance(error, DownloadFailure) and error.reason in ('http_429', 'rate_limited', 'login_or_rate_limit'):
+        return 'The video source is rate-limiting requests from this server. No video was downloaded. Please try later or send another link.'
+    return 'I could not download or send this video. Please check that the link is public and try another short video.'
+
+
+def send_text(sender, text):
+    if not MOCK:
+        graph(os.environ['WHATSAPP_PHONE_NUMBER_ID'] + '/messages', json.dumps({
+            'messaging_product': 'whatsapp', 'to': sender, 'type': 'text',
+            'text': {'body': text}}).encode())
+
+
 @contextmanager
 def db():
     conn = sqlite3.connect(DB, timeout=10)
@@ -82,7 +101,7 @@ def process(job_id, sender, url):
                     reason = label
                     break
             app.logger.warning('Video download rejected reason=%s', reason)
-            raise subprocess.CalledProcessError(download.returncode, ['yt_dlp'])
+            raise DownloadFailure(reason)
         source = next(p for p in Path(directory).glob('source.*') if p.suffix not in ('.part','.ytdl'))
         app.logger.info('Video download completed bytes=%s', source.stat().st_size)
         if source.stat().st_size > 30 * 1024 * 1024:
@@ -125,6 +144,10 @@ def worker():
             state = 'failed'
             app.logger.warning('Video job failed error_type=%s exit_code=%s elapsed_seconds=%.1f',
                 type(error).__name__, getattr(error, 'returncode', None), time.monotonic() - started)
+            try:
+                send_text(sender, failure_text(error))
+            except Exception as notification_error:
+                app.logger.warning('Failure notification failed error_type=%s', type(notification_error).__name__)
         finally:
             with db() as conn:
                 conn.execute('UPDATE jobs SET state=? WHERE id=?',(state, job_id))
