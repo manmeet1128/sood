@@ -60,7 +60,20 @@ def process(job_id, sender, url):
             '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
         if target.stat().st_size > 15 * 1024 * 1024:
-            raise ValueError('Video too large for this bot')
+            # Retry with a duration-based bitrate and room for audio/container overhead.
+            duration = min(180, float(subprocess.check_output(['ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', str(target)],
+                timeout=15)))
+            if duration <= 0:
+                raise ValueError('Invalid video duration')
+            bitrate = max(100000, int(13 * 1024 * 1024 * 8 / duration) - 96000)
+            subprocess.run(['ffmpeg','-y','-nostdin','-v','error','-i',str(source),'-t','180',
+                '-vf',"scale='min(720,iw)':-2",'-c:v','libx264','-preset','veryfast',
+                '-b:v',str(bitrate),'-maxrate',str(bitrate),'-bufsize',str(bitrate * 2),
+                '-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart',str(target)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+            if target.stat().st_size > 15 * 1024 * 1024:
+                raise ValueError('Video too large for this bot')
         send_video(sender, target)
 
 
